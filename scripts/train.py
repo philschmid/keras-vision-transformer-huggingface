@@ -5,15 +5,41 @@ import sys
 
 import numpy as np
 import tensorflow as tf
-from datasets import load_dataset, load_metric
+import datasets
 from transformers import (
-    AutoTokenizer,
-    TFAutoModelForTokenClassification,
-    DataCollatorForTokenClassification,
+    ViTFeatureExtractor,
+    TFViTForImageClassification,
+    DefaultDataCollator,
     create_optimizer,
 )
 from transformers.keras_callbacks import PushToHubCallback
-from tensorflow.keras.callbacks import TensorBoard as TensorboardCallback
+from tensorflow.keras.callbacks import TensorBoard as TensorboardCallback,EarlyStopping
+
+
+def create_image_folder_dataset(root_path):
+  """creates `Dataset` from image folder structure"""
+  
+  # get class names by folders names
+  _CLASS_NAMES= os.listdir(root_path)
+  # defines `datasets` features`
+  features=datasets.Features({
+                      "img": datasets.Image(),
+                      "label": datasets.features.ClassLabel(names=_CLASS_NAMES),
+                  })
+  # temp list holding datapoints for creation
+  img_data_files=[]
+  label_data_files=[]
+  # load images into list for creation
+  for img_class in os.listdir(root_path):
+    for img in os.listdir(os.path.join(root_path,img_class)):
+      path_=os.path.join(root_path,img_class,img)
+      img_data_files.append(path_)
+      label_data_files.append(img_class)
+  # create dataset
+  ds = datasets.Dataset.from_dict({"img":img_data_files,"label":label_data_files},features=features)
+  return ds
+
+
 
 if __name__ == "__main__":
 
@@ -21,7 +47,6 @@ if __name__ == "__main__":
 
     # Hyperparameters sent by the client are passed as command-line arguments to the script.
     parser.add_argument("--model_id", type=str)
-    parser.add_argument("--dataset_id", type=str)
     parser.add_argument("--num_train_epochs", type=int, default=5)
     parser.add_argument("--train_batch_size", type=int, default=16)
     parser.add_argument("--eval_batch_size", type=int, default=32)
@@ -48,80 +73,57 @@ if __name__ == "__main__":
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
 
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.model_id)
+    # Load Dataset from local path
+    dataset_path="/opt/ml/input/data/dataset"
+    eurosat_ds = create_image_folder_dataset(dataset_path)
+    img_class_labels = eurosat_ds.features["label"].names
 
-    # Load DatasetDict
-    dataset = load_dataset(args.dataset_id)
-    ner_labels = dataset["train"].features["ner_tags"].feature.names
 
-    # Preprocess train dataset
-    def tokenize_and_align_labels(examples):
-        tokenized_inputs = tokenizer(examples["tokens"], truncation=True, is_split_into_words=True)
+    feature_extractor = ViTFeatureExtractor.from_pretrained(args.model_id)
 
-        labels = []
-        for i, label in enumerate(examples[f"ner_tags"]):
-            # get a list of tokens their connecting word id (for words tokenized into multiple chunks)
-            word_ids = tokenized_inputs.word_ids(batch_index=i)
-            previous_word_idx = None
-            label_ids = []
-            for word_idx in word_ids:
-                # Special tokens have a word id that is None. We set the label to -100 so they are automatically
-                # ignored in the loss function.
-                if word_idx is None:
-                    label_ids.append(-100)
-                # We set the label for the first token of each word.
-                elif word_idx != previous_word_idx:
-                    label_ids.append(label[word_idx])
-                # For the other tokens in a word, we set the label to the current
-                else:
-                    label_ids.append(label[word_idx])
-                previous_word_idx = word_idx
+    # basic processing (only resizing)
+    def process(examples):
+        examples.update(feature_extractor(examples['img'], ))
+        return examples
 
-            labels.append(label_ids)
+    # we are also renaming our label col to labels to use `.to_tf_dataset` later
+    eurosat_ds = eurosat_ds.rename_column("label", "labels")
+    processed_dataset = eurosat_ds.map(process, batched=True)
 
-        tokenized_inputs["labels"] = labels
-        return tokenized_inputs
 
-    tokenized_datasets = dataset.map(tokenize_and_align_labels, batched=True)
+    test_size=.15
 
-    # define tokenizer_columns
-    # tokenizer_columns is the list of keys from the dataset that get passed to the TensorFlow model
-    pre_tokenizer_columns = set(dataset["train"].features)
-    tokenizer_columns = list(set(tokenized_datasets["train"].features) - pre_tokenizer_columns)
-
-    # test size will be 15% of train dataset
-    test_size = 0.15
-    processed_dataset = tokenized_datasets["train"].shuffle().train_test_split(test_size=test_size)
+    processed_dataset = processed_dataset.shuffle().train_test_split(test_size=test_size)
 
     # convert to TF datasets
     # Data collator that will dynamically pad the inputs received, as well as the labels.
-    data_collator = DataCollatorForTokenClassification(tokenizer=tokenizer, return_tensors="tf")
+    data_collator = DefaultDataCollator(return_tensors="tf")
 
     # converting our train dataset to tf.data.Dataset
-    tf_train_dataset = processed_dataset["train"].to_tf_dataset(
-        columns=tokenizer_columns,
-        shuffle=False,
+        tf_train_dataset = processed_dataset["train"].to_tf_dataset(
+        columns=['pixel_values'],
+        label_cols=["labels"],
+        shuffle=True,
         batch_size=args.train_batch_size,
-        collate_fn=data_collator,
-    )
+        collate_fn=data_collator)
 
     # converting our test dataset to tf.data.Dataset
     tf_eval_dataset = processed_dataset["test"].to_tf_dataset(
-        columns=tokenizer_columns,
-        shuffle=False,
-        batch_size=args.eval_batch_size,
-        collate_fn=data_collator,
-    )
+    columns=['pixel_values'],
+    label_cols=["labels"],
+    shuffle=True,
+    batch_size=args.eval_batch_size,
+    collate_fn=data_collator)
 
     # Prepare model labels - useful in inference API
-    id2label = {str(i): label for i, label in enumerate(ner_labels)}
+    id2label = {str(i): label for i, label in enumerate(img_class_labels)}
     label2id = {v: k for k, v in id2label.items()}
 
     # enable mixed precision training
     if args.fp16:
         tf.keras.mixed_precision.set_global_policy("mixed_float16")
 
+    # create optimizer wight weigh decay
     num_train_steps = len(tf_train_dataset) * args.num_train_epochs
     optimizer, lr_schedule = create_optimizer(
         init_lr=args.learning_rate,
@@ -130,16 +132,32 @@ if __name__ == "__main__":
         num_warmup_steps=args.num_warmup_steps,
     )
 
-    model = TFAutoModelForTokenClassification.from_pretrained(
+    # load pre-trained ViT model
+    model = TFViTForImageClassification.from_pretrained(
         args.model_id,
+        num_labels=len(img_class_labels),
         id2label=id2label,
         label2id=label2id,
     )
 
-    model.compile(optimizer=optimizer)
+    # define loss
+    loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+
+    # define metrics 
+    metrics=[
+        tf.keras.metrics.SparseCategoricalAccuracy(name="accuracy"),
+        tf.keras.metrics.SparseTopKCategoricalAccuracy(3, name="top-3-accuracy"),
+    ]
+
+    # compile model
+    model.compile(optimizer=optimizer,
+                loss=loss,
+                metrics=metrics
+                )
 
     callbacks = []
     callbacks.append(TensorboardCallback(log_dir=os.path.join(args.model_dir, "logs")))
+    callbacks.append(EarlyStopping(monitor="val_accuracy",patience=1))
 
     # TODO: add with new DLC supporting Transformers 4.14.1
     # if args.hub_token:
@@ -161,25 +179,6 @@ if __name__ == "__main__":
         epochs=args.num_train_epochs,
     )
 
-    metric = load_metric("seqeval")
-
-    def evaluate(model, dataset, ner_labels):
-        all_predictions = []
-        all_labels = []
-        for batch in dataset:
-            logits = model.predict(batch)["logits"]
-            labels = batch["labels"]
-            predictions = np.argmax(logits, axis=-1)
-            for prediction, label in zip(predictions, labels):
-                for predicted_idx, label_idx in zip(prediction, label):
-                    if label_idx == -100:
-                        continue
-                    all_predictions.append(ner_labels[predicted_idx])
-                    all_labels.append(ner_labels[label_idx])
-        return metric.compute(predictions=[all_predictions], references=[all_labels])
-
-    results = evaluate(model, tf_eval_dataset, ner_labels=list(model.config.id2label.values()))
-    logger.info(results)
     # Save result
     model.save_pretrained(args.model_dir)
-    tokenizer.save_pretrained(args.model_dir)
+    feature_extractor.save_pretrained(args.model_dir)
