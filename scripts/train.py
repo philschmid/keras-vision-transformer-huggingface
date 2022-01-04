@@ -100,12 +100,12 @@ if __name__ == "__main__":
     data_collator = DefaultDataCollator(return_tensors="tf")
 
     # converting our train dataset to tf.data.Dataset
-        tf_train_dataset = processed_dataset["train"].to_tf_dataset(
-        columns=['pixel_values'],
-        label_cols=["labels"],
-        shuffle=True,
-        batch_size=args.train_batch_size,
-        collate_fn=data_collator)
+    tf_train_dataset = processed_dataset["train"].to_tf_dataset(
+    columns=['pixel_values'],
+    label_cols=["labels"],
+    shuffle=True,
+    batch_size=args.train_batch_size,
+    collate_fn=data_collator)
 
     # converting our test dataset to tf.data.Dataset
     tf_eval_dataset = processed_dataset["test"].to_tf_dataset(

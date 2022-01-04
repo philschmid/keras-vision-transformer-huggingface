@@ -1,4 +1,3 @@
-seqeval 
 tensorboard
 transformers
 datasets>=1.17.0
